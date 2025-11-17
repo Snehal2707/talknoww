@@ -52,6 +52,27 @@ const app = express();
 app.use(cors({ origin: CLIENT_ORIGINS }));
 app.use(express.json());
 
+app.get('/', (_req, res) => {
+  res.json({
+    message: 'ChatCorner Backend API',
+    version: '1.0.0',
+    endpoints: {
+      health: '/health',
+      auth: {
+        register: 'POST /auth/register',
+        login: 'POST /auth/login',
+        logout: 'POST /auth/logout',
+        session: 'GET /auth/session',
+        verifyAge: 'POST /auth/verify-age'
+      },
+      subscription: {
+        plans: 'GET /subscription/plans',
+        activate: 'POST /subscription/activate'
+      }
+    }
+  });
+});
+
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });

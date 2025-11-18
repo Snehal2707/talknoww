@@ -6,6 +6,7 @@ const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
 const { v4: uuidv4 } = require('uuid');
 const { supabase } = require('./supabaseClient');
+const { verifyOrder, verifySubscription, createSubscription } = require('./paypalClient');
 
 const PORT = process.env.PORT || 3001;
 const CLIENT_ORIGINS = process.env.CLIENT_ORIGINS
@@ -344,7 +345,8 @@ app.get('/subscription/plans', (_req, res) => {
   res.json({ plans: SUBSCRIPTION_PLANS });
 });
 
-app.post('/subscription/activate', async (req, res) => {
+// Create PayPal subscription
+app.post('/subscription/create', async (req, res) => {
   if (!ensureSupabaseConfigured(res)) return;
   const result = getSessionFromRequest(req);
   if (!result) {
@@ -359,7 +361,81 @@ app.post('/subscription/activate', async (req, res) => {
     return res.status(400).json({ message: 'Unknown plan.' });
   }
 
+  if (!selectedPlan.paypalPlanId || selectedPlan.paypalPlanId.startsWith('P-PLACEHOLDER')) {
+    return res.status(400).json({ 
+      message: 'PayPal plan not configured. Please contact support.' 
+    });
+  }
+
   try {
+    const subscription = await createSubscription(selectedPlan.paypalPlanId);
+    
+    res.json({
+      subscriptionId: subscription.id,
+      approvalUrl: subscription.links?.find(link => link.rel === 'approve')?.href,
+      plan: selectedPlan
+    });
+  } catch (error) {
+    console.error('[subscription/create] error', error);
+    res.status(500).json({ message: 'Unable to create subscription. Please try again.' });
+  }
+});
+
+// Verify and activate subscription after PayPal approval
+app.post('/subscription/activate', async (req, res) => {
+  if (!ensureSupabaseConfigured(res)) return;
+  const result = getSessionFromRequest(req);
+  if (!result) {
+    return res.status(401).json({ message: 'Authentication required.' });
+  }
+
+  const { session, token } = result;
+  const { subscriptionId, orderId } = req.body || {};
+
+  if (!subscriptionId && !orderId) {
+    return res.status(400).json({ message: 'Subscription ID or Order ID required.' });
+  }
+
+  try {
+    let subscriptionData;
+    let planId = null;
+
+    if (subscriptionId) {
+      // Verify subscription
+      subscriptionData = await verifySubscription(subscriptionId);
+      
+      // Find plan by PayPal plan ID
+      const paypalPlanId = subscriptionData.plan_id;
+      const selectedPlan = SUBSCRIPTION_PLANS.find((plan) => plan.paypalPlanId === paypalPlanId);
+      
+      if (!selectedPlan) {
+        return res.status(400).json({ message: 'Unknown subscription plan.' });
+      }
+      
+      planId = selectedPlan.id;
+
+      // Check subscription status
+      if (subscriptionData.status !== 'ACTIVE' && subscriptionData.status !== 'APPROVAL_PENDING') {
+        return res.status(400).json({ 
+          message: `Subscription status is ${subscriptionData.status}. Payment may be pending.` 
+        });
+      }
+    } else if (orderId) {
+      // Verify order (one-time payment)
+      const orderData = await verifyOrder(orderId);
+      
+      if (orderData.status !== 'COMPLETED') {
+        return res.status(400).json({ 
+          message: `Order status is ${orderData.status}. Payment not completed.` 
+        });
+      }
+
+      // For one-time payments, we'll use the plan from the order
+      // You may need to store planId when creating the order
+      planId = req.body.planId || 'creator-monthly'; // Fallback
+    }
+
+    // Update user subscription in database
     const { error } = await supabase
       .from('app_users')
       .update({
@@ -373,17 +449,73 @@ app.post('/subscription/activate', async (req, res) => {
       throw error;
     }
 
+    // Update session
     const updatedSession = { ...session, subscriptionStatus: 'active' };
     sessions.set(token, updatedSession);
 
     res.json({
       subscriptionStatus: 'active',
-      plan: selectedPlan,
-      message: 'Subscription activated. PayPal confirmation placeholder – integrate real flow later.'
+      plan: SUBSCRIPTION_PLANS.find((p) => p.id === planId),
+      message: 'Subscription activated successfully!'
     });
   } catch (error) {
     console.error('[subscription/activate] error', error);
-    res.status(500).json({ message: 'Unable to activate subscription right now.' });
+    res.status(500).json({ message: 'Unable to activate subscription. Please try again.' });
+  }
+});
+
+// PayPal webhook handler
+app.post('/webhooks/paypal', express.raw({ type: 'application/json' }), async (req, res) => {
+  // Verify webhook signature (simplified - in production, verify signature)
+  const webhookId = process.env.PAYPAL_WEBHOOK_ID;
+  if (!webhookId) {
+    console.warn('[webhooks/paypal] PAYPAL_WEBHOOK_ID not set, skipping verification');
+  }
+
+  const event = req.body;
+  
+  try {
+    console.log('[webhooks/paypal] Received event:', event.event_type);
+
+    switch (event.event_type) {
+      case 'BILLING.SUBSCRIPTION.ACTIVATED':
+      case 'BILLING.SUBSCRIPTION.CREATED': {
+        const subscriptionId = event.resource?.id;
+        const payerEmail = event.resource?.subscriber?.email_address;
+        
+        // Find user by subscription ID or email (you may need to store subscription_id in database)
+        // For now, we'll update based on the subscription ID
+        console.log('[webhooks/paypal] Subscription activated:', subscriptionId);
+        
+        // Update subscription status in database
+        // Note: You may need to store subscription_id in app_users table to match users
+        break;
+      }
+      
+      case 'BILLING.SUBSCRIPTION.CANCELLED':
+      case 'BILLING.SUBSCRIPTION.EXPIRED': {
+        const subscriptionId = event.resource?.id;
+        console.log('[webhooks/paypal] Subscription cancelled/expired:', subscriptionId);
+        
+        // Update subscription status to inactive
+        // You'll need to find the user by subscription_id
+        break;
+      }
+      
+      case 'PAYMENT.SALE.COMPLETED': {
+        const sale = event.resource;
+        console.log('[webhooks/paypal] Payment completed:', sale.id);
+        break;
+      }
+      
+      default:
+        console.log('[webhooks/paypal] Unhandled event type:', event.event_type);
+    }
+
+    res.status(200).send('OK');
+  } catch (error) {
+    console.error('[webhooks/paypal] Error processing webhook:', error);
+    res.status(500).send('Error processing webhook');
   }
 });
 

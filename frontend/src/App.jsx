@@ -309,40 +309,105 @@ function SubscriptionScreen({ token, user, onActivated, onLogout, theme, onTheme
   }, []);
 
   const selectedPlan = plans.find((plan) => plan.id === selectedPlanId) || null;
+  const paypalButtonRef = useRef(null);
 
-  const handleActivate = async () => {
-    if (!selectedPlan) {
-      setError('Select a plan before continuing.');
+  // Initialize PayPal button when plan is selected
+  useEffect(() => {
+    if (!selectedPlan || !window.paypal) {
       return;
     }
 
-    setIsActivating(true);
-    setError('');
-    setSuccess('');
-
-    try {
-      const response = await fetch(`${API_URL}/subscription/activate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
-        },
-        body: JSON.stringify({ planId: selectedPlan.id })
-      });
-
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        throw new Error(payload.message || 'Unable to activate subscription.');
-      }
-
-      setSuccess(payload.message || 'Subscription activated.');
-      onActivated({ plan: selectedPlan, message: payload.message });
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setIsActivating(false);
+    // Clear previous button
+    if (paypalButtonRef.current) {
+      paypalButtonRef.current.innerHTML = '';
     }
-  };
+
+    // Create PayPal subscription button
+    async function createPayPalButton() {
+      try {
+        // First, create subscription on backend
+        const createResponse = await fetch(`${API_URL}/subscription/create`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`
+          },
+          body: JSON.stringify({ planId: selectedPlan.id })
+        });
+
+        const createData = await createResponse.json().catch(() => ({}));
+        if (!createResponse.ok) {
+          throw new Error(createData.message || 'Unable to create subscription.');
+        }
+
+        const { subscriptionId, approvalUrl } = createData;
+
+        if (!approvalUrl) {
+          throw new Error('PayPal approval URL not received.');
+        }
+
+        // Render PayPal button
+        if (paypalButtonRef.current && window.paypal) {
+          window.paypal.Buttons({
+            style: {
+              layout: 'vertical',
+              color: 'blue',
+              shape: 'rect',
+              label: 'subscribe'
+            },
+            createSubscription: async (data, actions) => {
+              return subscriptionId;
+            },
+            onApprove: async (data, actions) => {
+              setIsActivating(true);
+              setError('');
+              setSuccess('');
+
+              try {
+                // Verify and activate subscription
+                const activateResponse = await fetch(`${API_URL}/subscription/activate`, {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`
+                  },
+                  body: JSON.stringify({ 
+                    subscriptionId: data.subscriptionID 
+                  })
+                });
+
+                const activateData = await activateResponse.json().catch(() => ({}));
+                if (!activateResponse.ok) {
+                  throw new Error(activateData.message || 'Unable to activate subscription.');
+                }
+
+                setSuccess(activateData.message || 'Subscription activated successfully!');
+                setTimeout(() => {
+                  onActivated({ plan: selectedPlan, message: activateData.message });
+                }, 1500);
+              } catch (err) {
+                setError(err.message || 'Payment approved but activation failed. Please contact support.');
+              } finally {
+                setIsActivating(false);
+              }
+            },
+            onError: (err) => {
+              setError('PayPal error: ' + (err.message || 'Payment could not be processed.'));
+              setIsActivating(false);
+            },
+            onCancel: () => {
+              setError('Payment cancelled. Please try again when ready.');
+            }
+          }).render(paypalButtonRef.current);
+        }
+      } catch (err) {
+        setError(err.message || 'Unable to initialize PayPal. Please try again.');
+        setIsActivating(false);
+      }
+    }
+
+    createPayPalButton();
+  }, [selectedPlan, token, onActivated]);
 
   return (
     <div className={`relative min-h-screen overflow-hidden ${theme === 'dark' ? 'dark' : 'light'}`}>
@@ -452,18 +517,24 @@ function SubscriptionScreen({ token, user, onActivated, onLogout, theme, onTheme
               <p>If the PayPal window closes unexpectedly, simply retry the activation—no duplicate charges occur for incomplete orders.</p>
             </div>
 
-            <div className="mt-8 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <button
-                type="button"
-                onClick={handleActivate}
-                disabled={isActivating || !selectedPlan}
-                className="inline-flex items-center justify-center gap-2 rounded-2xl bg-[#0070ba] px-6 py-3 text-sm font-semibold text-white shadow-lg shadow-[#0070ba]/30 transition hover:bg-[#005c99] disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {isActivating ? <Loader2 className="size-4 animate-spin" /> : <CreditCard className="size-4" />}
-                Continue with PayPal
-              </button>
+            <div className="mt-8 flex flex-col gap-4">
+              {selectedPlan ? (
+                <div className="flex flex-col gap-3">
+                  <div ref={paypalButtonRef} className="flex justify-center"></div>
+                  {isActivating && (
+                    <div className="flex items-center justify-center gap-2 text-sm text-slate-600 dark:text-slate-300">
+                      <Loader2 className="size-4 animate-spin" />
+                      Processing subscription...
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="rounded-2xl border border-slate-200/70 bg-slate-50/80 p-4 text-center text-sm text-slate-500 dark:border-slate-800/60 dark:bg-slate-800/50 dark:text-slate-400">
+                  Please select a plan above to continue
+                </div>
+              )}
 
-              <p className="text-xs text-slate-500 dark:text-slate-400">
+              <p className="text-center text-xs text-slate-500 dark:text-slate-400">
                 Having trouble? Contact support with your username and PayPal receipt.
               </p>
             </div>
